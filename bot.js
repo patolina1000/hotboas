@@ -12,7 +12,11 @@ const fs = require('fs');
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const PUSHINPAY_TOKEN = process.env.PUSHINPAY_TOKEN;
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
+
+const bot = new TelegramBot(TELEGRAM_TOKEN);
+bot.setWebHook(`${BASE_URL}/bot${TELEGRAM_TOKEN}`);
+
 
 const db = new Database('./pagamentos.db');
 db.prepare(`
@@ -25,6 +29,7 @@ db.prepare(`
 const app = express();
 const PORT = 3000;
 app.use(cors());
+app.use(express.json());
 app.use(bodyParser.json());
 
 app.post('/api/gerar-cobranca', async (req, res) => {
@@ -101,6 +106,11 @@ app.post('/webhook/pushinpay', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Servidor rodando na porta ${PORT}`);
+});
+
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
 
 bot.onText(/\/start/, async (msg) => {
@@ -197,7 +207,7 @@ bot.on('callback_query', async (query) => {
     if (!plano) return;
 
     try {
-      const resposta = await axios.post('http://localhost:3000/api/gerar-cobranca', {
+      const resposta = await axios.post(`${BASE_URL}/api/gerar-cobranca`, {
         telegram_id: chatId,
         plano: plano.nome,
         valor: plano.valorComDesconto
@@ -235,7 +245,7 @@ bot.on('callback_query', async (query) => {
   if (!plano) return;
 
   try {
-    const resposta = await axios.post('http://localhost:3000/api/gerar-cobranca', {
+    const resposta = await axios.post(`${BASE_URL}/api/gerar-cobranca`, {
       telegram_id: chatId,
       plano: plano.nome,
       valor: plano.valor
