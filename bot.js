@@ -6,10 +6,11 @@ const axios = require('axios');
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const sharp = require('sharp');
 const config = require('./config');
 const Database = require('better-sqlite3');
-const fs = require('fs');
+const { gerarPixBuffer, enviarQRCode } = require('./utils/pix');
+const { logEvento } = require('./utils/logger');
+const { enviarDownsells } = require('./controllers/downsells');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const PUSHINPAY_TOKEN = process.env.PUSHINPAY_TOKEN;
@@ -26,6 +27,7 @@ db.prepare(`
   )
 `).run();
 
+
 const app = express();
 const PORT = 3000;
 app.use(cors());
@@ -35,27 +37,24 @@ app.use(bodyParser.json());
 app.post('/api/gerar-cobranca', async (req, res) => {
   const { telegram_id, plano, valor } = req.body;
 
-  if (!telegram_id || !plano || !valor) {
-    return res.status(400).json({ error: 'Parâmetros inválidos: telegram_id, plano e valor são obrigatórios.' });
+  if (typeof telegram_id !== 'string' || !/^\d+$/.test(telegram_id) || !plano || isNaN(valor)) {
+    return res.status(400).json({ error: 'Parâmetros inválidos.' });
   }
 
   const valorCentavos = Math.round(parseFloat(valor) * 100);
-  if (isNaN(valorCentavos) || valorCentavos < 50) {
+  if (valorCentavos < 50) {
     return res.status(400).json({ error: 'Valor mínimo é R$0,50.' });
   }
 
-  const referencia = `tgid:${telegram_id}|plano:${plano}|valor:${valorCentavos}`;
+ const referencia = `tgid:${telegram_id}|plano:${plano}|valor:${valorCentavos}`;
 
   try {
     const response = await axios.post(
       'https://api.pushinpay.com.br/api/pix/cashIn',
-      {
-        value: valorCentavos,
-        description: referencia
-      },
+      { value: valorCentavos, description: referencia },
       {
         headers: {
-          Authorization: `Bearer ${PUSHINPAY_TOKEN}`,
+          Authorization: `Bearer \${PUSHINPAY_TOKEN}`,
           'Content-Type': 'application/json',
           Accept: 'application/json'
         }
@@ -63,20 +62,15 @@ app.post('/api/gerar-cobranca', async (req, res) => {
     );
 
     const { qr_code_base64, qr_code, pix_copy_paste, id } = response.data;
-
-    return res.json({
+    res.json({
       qr_code_base64,
       qr_code,
       pix_copia_cola: pix_copy_paste || qr_code,
       transacao_id: id
     });
-
   } catch (error) {
-    console.error("❌ Erro ao gerar cobrança:", error.response?.data || error.message);
-    return res.status(500).json({
-      error: 'Erro ao gerar cobrança na API PushinPay.',
-      detalhes: error.response?.data || error.message
-    });
+    logEvento('Erro ao gerar cobrança: ' + (error.response?.data || error.message), 'erro');
+    res.status(500).json({ error: 'Erro ao gerar cobrança.' });
   }
 });
 
@@ -93,16 +87,16 @@ app.post('/webhook/pushinpay', async (req, res) => {
     await bot.sendMessage(telegram_id, config.pagamento.link);
     db.prepare('DELETE FROM downsell_progress WHERE telegram_id = ?').run(telegram_id);
 
-    console.log(`✅ Webhook processado para ${telegram_id}`);
+    logEvento(`Webhook processado para ${telegram_id}`, 'sucesso');
     res.sendStatus(200);
   } catch (err) {
-    console.error('❌ Erro no webhook PushinPay:', err.message);
+    logEvento('Erro no webhook: ' + err.message, 'erro');
     res.sendStatus(500);
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  logEvento(`Servidor rodando na porta ${PORT}`);
 });
 
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
@@ -114,7 +108,7 @@ bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
 
   if (config.inicio.tipoMidia === 'imagem') {
-    await bot.sendPhoto(chatId, { source: config.inicio.midia, filename: 'inicio.png' });
+    await bot.sendPhoto(chatId, { source: config.inicio.midia, filename: 'inicio.jpg' });
   } else {
     await bot.sendVideo(chatId, config.inicio.midia);
   }
@@ -140,172 +134,6 @@ bot.onText(/\/start/, async (msg) => {
   }
 });
 
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-
-  if (data === 'mostrar_planos') {
-    const botoesPlanos = config.planos.map(plano => ([{
-      text: `${plano.emoji} ${plano.nome} — por R$${plano.valor.toFixed(2)}`,
-      callback_data: plano.id
-    }]));
-
-    return bot.sendMessage(chatId, '💖 Escolha seu plano abaixo, titio:', {
-      reply_markup: { inline_keyboard: botoesPlanos }
-    });
-  }
-
-  if (data === 'ver_previas') {
-    return bot.sendMessage(chatId, `🙈 <b>Pronto pra espiar?</b>\n\n💗 Entra no meu canal exclusivo de prévias grátis:\n👉 ${config.canalPrevias}\n\nLá dentro tem umas coisinhas que vão deixar o titio querendo mais... 😏`, {
-      parse_mode: 'HTML'
-    });
-  }
-
-  if (data.startsWith('verificar_pagamento_')) {
-    const transacaoId = data.replace('verificar_pagamento_', '');
-    try {
-      const response = await axios.get(`https://api.pushinpay.com.br/api/transactions/${transacaoId}`, {
-        headers: {
-          Authorization: `Bearer ${PUSHINPAY_TOKEN}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json'
-        }
-      });
-
-      const status = response.data.status;
-      if (status === 'paid') {
-        await bot.sendMessage(chatId, config.pagamento.aprovado);
-        await bot.sendMessage(chatId, config.pagamento.link);
-        db.prepare('DELETE FROM downsell_progress WHERE telegram_id = ?').run(chatId);
-      } else if (status === 'created') {
-        await bot.sendMessage(chatId, config.pagamento.pendente);
-      } else if (status === 'expired') {
-        await bot.sendMessage(chatId, config.pagamento.expirado);
-      } else {
-        await bot.sendMessage(chatId, `⚠️ Status atual da cobrança: ${status}`);
-      }
-    } catch (err) {
-      console.error('Erro ao verificar pagamento:', err.response?.data || err.message);
-      bot.sendMessage(chatId, config.pagamento.erro);
-    }
-    return;
-  }
-
-  if (data.startsWith('comprar_')) {
-    const partes = data.split('_');
-    const downsellId = partes[1];
-    const planoId = partes.slice(2).join('_');
-    const etapa = config.downsells.find(ds => ds.id === downsellId);
-    if (!etapa) return;
-    const plano = etapa.planos.find(p => p.id === planoId);
-    if (!plano) return;
-
-    try {
-      const resposta = await axios.post(`${BASE_URL}/api/gerar-cobranca`, {
-        telegram_id: chatId,
-        plano: plano.nome,
-        valor: plano.valorComDesconto
-      });
-
-      const { qr_code_base64, pix_copia_cola, transacao_id } = resposta.data;
-      const base64Image = qr_code_base64.replace(/^data:image\/png;base64,/, '');
-      const imageBuffer = Buffer.from(base64Image, 'base64');
-      const buffer = await sharp(imageBuffer)
-        .extend({ top: 40, bottom: 40, left: 40, right: 40, background: { r: 255, g: 255, b: 255, alpha: 1 } })
-        .png()
-        .toBuffer();
-
-      const legenda = config.mensagemPix(plano.nome, plano.valorComDesconto, pix_copia_cola);
-      await bot.sendPhoto(chatId, { source: buffer, filename: 'qrcode.png' }, {
-        caption: legenda,
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [[{ text: '✅ Verificar Status do Pagamento', callback_data: `verificar_pagamento_${transacao_id}` }]]
-        }
-      });
-    } catch (err) {
-      console.error('Erro ao gerar cobrança:', err.response?.data || err.message);
-      bot.sendMessage(chatId, '❌ Ocorreu um erro ao gerar o PIX. Tente novamente mais tarde.');
-    }
-    return;
-  }
-
-  const plano = config.planos.find(p => p.id === data);
-  if (!plano) return;
-
-  try {
-    const resposta = await axios.post(`${BASE_URL}/api/gerar-cobranca`, {
-      telegram_id: chatId,
-      plano: plano.nome,
-      valor: plano.valor
-    });
-
-    const { qr_code_base64, pix_copia_cola, transacao_id } = resposta.data;
-    const base64Image = qr_code_base64.replace(/^data:image\/png;base64,/, '');
-    const imageBuffer = Buffer.from(base64Image, 'base64');
-    const buffer = await sharp(imageBuffer)
-      .extend({ top: 40, bottom: 40, left: 40, right: 40, background: { r: 255, g: 255, b: 255, alpha: 1 } })
-      .png()
-      .toBuffer();
-
-    const legenda = config.mensagemPix(plano.nome, plano.valor, pix_copia_cola);
-    await bot.sendPhoto(chatId, { source: buffer, filename: 'qrcode.png' }, {
-      caption: legenda,
-      parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [[{ text: '✅ Verificar Status do Pagamento', callback_data: `verificar_pagamento_${transacao_id}` }]]
-      }
-    });
-  } catch (err) {
-    console.error('Erro ao gerar cobrança:', err.response?.data || err.message);
-    bot.sendMessage(chatId, '❌ Ocorreu um erro ao gerar o PIX. Tente novamente mais tarde.');
-  }
-});
-
-const enviarDownsells = async () => {
-  const usuarios = db.prepare('SELECT telegram_id, index_downsell FROM downsell_progress').all();
-  for (const usuario of usuarios) {
-    const chatId = usuario.telegram_id;
-    const indexAtual = usuario.index_downsell;
-    const downsell = config.downsells[indexAtual];
-    if (!downsell) continue;
-
-    try {
-      const botoes = downsell.planos.map(plano => [{
-        text: `${plano.emoji} ${plano.nome} por R$${plano.valorComDesconto.toFixed(2)} (${Math.round(100 - (plano.valorComDesconto * 100 / plano.valorOriginal))}% OFF)` ,
-        callback_data: `comprar_${downsell.id}_${plano.id}`
-      }]);
-
-      if (fs.existsSync(downsell.midia)) {
-        if (downsell.midia.endsWith('.mp4')) {
-          await bot.sendVideo(chatId, downsell.midia, {
-            caption: downsell.texto,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: botoes }
-          });
-        } else {
-          await bot.sendPhoto(chatId, { source: downsell.midia, filename: 'downsell.jpg' }, {
-            caption: downsell.texto,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: botoes }
-          });
-        }
-      } else {
-        console.warn(`⚠️ Mídia não encontrada: ${downsell.midia}`);
-        await bot.sendMessage(chatId, downsell.texto, {
-          parse_mode: 'HTML',
-          reply_markup: { inline_keyboard: botoes }
-        });
-      }
-
-      db.prepare('UPDATE downsell_progress SET index_downsell = ? WHERE telegram_id = ?')
-        .run(indexAtual + 1, chatId);
-    } catch (err) {
-      console.error(`Erro ao enviar downsell para ${chatId}:`, err.message);
-    }
-  }
-};
-
 setInterval(() => {
-  enviarDownsells();
+  enviarDownsells(bot, db, config);
 }, 60 * 1000);
